@@ -1,9 +1,10 @@
-from flask import Flask, request, Response
+from flask import Flask, request, Response, jsonify
 import uuid
 import xml.etree.ElementTree as ET
 from pymongo import MongoClient
 from datetime import datetime
 import os
+from werkzeug.security import generate_password_hash, check_password_hash
 
 app = Flask(__name__)
 package_store = {}
@@ -116,7 +117,29 @@ def generate_customer_id(firebase_uid):
     """Use Firebase UID as customer ID"""
     return firebase_uid
 
-def create_customer_in_db(firebase_uid, name, email, phone, current_location=None):
+def verify_customer_password(email, password):
+    """Verify customer password - used for login"""
+    try:
+        if client is None:
+            return None, "Database connection not available"
+        
+        customer = customers_collection.find_one({"email": email})
+        if not customer:
+            return None, "Customer not found"
+        
+        if not customer.get("password"):
+            return None, "No password set for this customer"
+        
+        if check_password_hash(customer["password"], password):
+            customer["_id"] = str(customer["_id"])
+            del customer["password"]  # Never return password in response
+            return customer, None
+        else:
+            return None, "Invalid password"
+    except Exception as e:
+        return None, str(e)
+
+def create_customer_in_db(firebase_uid, name, email, phone, password, current_location=None):
     """Create customer in MongoDB"""
     try:
         if client is None:
@@ -134,11 +157,15 @@ def create_customer_in_db(firebase_uid, name, email, phone, current_location=Non
         if existing_customer:
             return None, "Customer already exists with this email or Firebase UID"
         
+        # Hash the password for security
+        hashed_password = generate_password_hash(password, method='pbkdf2:sha256')
+        
         # Create customer document
         customer_data = {
             "firebaseUID": firebase_uid,
             "name": name,
             "email": email,
+            "password": hashed_password,
             "role": "customer",
             "customer_id": generate_customer_id(firebase_uid),
             "phone": phone,
@@ -150,6 +177,9 @@ def create_customer_in_db(firebase_uid, name, email, phone, current_location=Non
         # Insert customer into MongoDB
         result = customers_collection.insert_one(customer_data)
         customer_data['_id'] = str(result.inserted_id)
+        
+        # Remove password from returned data for security
+        del customer_data['password']
         
         return customer_data, None
         
@@ -170,6 +200,7 @@ def customer_soap_service():
                 name = extract_text_by_tag_name(root, 'name')
                 email = extract_text_by_tag_name(root, 'email')
                 phone = extract_text_by_tag_name(root, 'phone')
+                password = extract_text_by_tag_name(root, 'password')
                 
                 # Handle location data with auto-detection
                 address = extract_text_by_tag_name(root, 'address')
@@ -214,12 +245,12 @@ def customer_soap_service():
                     }
                 
                 # Validate required fields
-                if not firebase_uid or not name or not email or not phone:
-                    response_body = '<create_customer_response><status>Error</status><message>Missing required fields: firebaseUID, name, email, phone</message></create_customer_response>'
+                if not firebase_uid or not name or not email or not phone or not password:
+                    response_body = '<create_customer_response><status>Error</status><message>Missing required fields: firebaseUID, name, email, phone, password</message></create_customer_response>'
                     return Response(create_soap_response(response_body), content_type='text/xml')
                 
                 # Create customer in database
-                customer_data, error = create_customer_in_db(firebase_uid, name, email, phone, current_location)
+                customer_data, error = create_customer_in_db(firebase_uid, name, email, phone, password, current_location)
                 
                 if error:
                     response_body = f'<create_customer_response><status>Error</status><message>{error}</message></create_customer_response>'
@@ -286,6 +317,46 @@ def customer_soap_service():
                         {location_xml}
                     </customer>
                 </get_customer_response>'''
+                return Response(create_soap_response(response_body), content_type='text/xml')
+
+            elif elem.tag.endswith('login_customer'):
+                email = extract_text_by_tag_name(root, 'email')
+                password = extract_text_by_tag_name(root, 'password')
+                
+                if not email or not password:
+                    response_body = '<login_customer_response><status>Error</status><message>Missing required fields: email, password</message></login_customer_response>'
+                    return Response(create_soap_response(response_body), content_type='text/xml')
+                
+                customer, error = verify_customer_password(email, password)
+                
+                if error:
+                    response_body = f'<login_customer_response><status>Error</status><message>{error}</message></login_customer_response>'
+                    return Response(create_soap_response(response_body), content_type='text/xml')
+                
+                print(f"Customer logged in: {customer['customer_id']} - {customer['name']}")
+                
+                location_xml = ""
+                if customer.get('current_location'):
+                    loc = customer['current_location']
+                    location_xml = f'''<current_location>
+                        <address>{loc.get('address', '')}</address>
+                        <latitude>{loc.get('latitude', '')}</latitude>
+                        <longitude>{loc.get('longitude', '')}</longitude>
+                    </current_location>'''
+                
+                response_body = f'''<login_customer_response>
+                    <status>Success</status>
+                    <message>Login successful</message>
+                    <customer>
+                        <customer_id>{customer['customer_id']}</customer_id>
+                        <firebaseUID>{customer['firebaseUID']}</firebaseUID>
+                        <name>{customer['name']}</name>
+                        <email>{customer['email']}</email>
+                        <phone>{customer['phone']}</phone>
+                        <role>{customer['role']}</role>
+                        {location_xml}
+                    </customer>
+                </login_customer_response>'''
                 return Response(create_soap_response(response_body), content_type='text/xml')
         
         return Response("Method not found", status=400)
@@ -779,12 +850,55 @@ def get_delivery_location():
         response_body = f'<get_delivery_location_response><status>Error</status><message>Internal server error: {str(e)}</message></get_delivery_location_response>'
         return Response(create_soap_response(response_body), content_type='text/xml', status=500)
 
+@app.route('/api/login', methods=['POST'])
+def rest_login():
+    """REST JSON endpoint for customer login.
+    Accepts: { "email": "...", "password": "..." }
+    Returns: JSON with customer data on success, or error message."""
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({"status": "Error", "message": "Request body must be JSON"}), 400
+
+        email = data.get('email', '').strip()
+        password = data.get('password', '').strip()
+
+        if not email or not password:
+            return jsonify({"status": "Error", "message": "Missing required fields: email, password"}), 400
+
+        customer, error = verify_customer_password(email, password)
+
+        if error:
+            return jsonify({"status": "Error", "message": error}), 401
+
+        print(f"[REST login] Customer logged in: {customer['customer_id']} - {customer['name']}")
+
+        return jsonify({
+            "status": "Success",
+            "message": "Login successful",
+            "customer": {
+                "customer_id": customer.get('customer_id', ''),
+                "firebaseUID": customer.get('firebaseUID', ''),
+                "name": customer.get('name', ''),
+                "email": customer.get('email', ''),
+                "phone": customer.get('phone', ''),
+                "role": customer.get('role', ''),
+                "current_location": customer.get('current_location', {})
+            }
+        }), 200
+
+    except Exception as e:
+        print(f"Error in REST login: {str(e)}")
+        return jsonify({"status": "Error", "message": f"Internal server error: {str(e)}"}), 500
+
+
 if __name__ == '__main__':
     print("CMS SOAP Server listening on http://127.0.0.1:8000")
     print("Available SOAP endpoints:")
     print("  - Customer Service: POST http://127.0.0.1:8000/customerService")
-    print("    * create_customer (firebaseUID, name, email, phone, [address, latitude, longitude])")
+    print("    * create_customer (firebaseUID, name, email, phone, password, [address, latitude, longitude])")
     print("    * get_customer (customer_id)")
+    print("    * login_customer (email, password)")
     print("  - Customer WSDL: GET http://127.0.0.1:8000/customerService?wsdl")
     print("  - Order Service: POST http://127.0.0.1:8000/orderService")
     print("    * new_package, update_package, get_package_status")
@@ -795,6 +909,7 @@ if __name__ == '__main__':
     print("  - Get All Orders: GET http://127.0.0.1:8000/getOrders/<customerID>")
     print("    * Returns all orders for a specific customer in SOAP/XML format")
     print("  - Update Order Status: POST http://127.0.0.1:8000/api/updateStatus (orderID, status)")
+    print("  - Login (REST/JSON): POST http://127.0.0.1:8000/api/login (email, password)")
     print("  - Get Delivery Location: POST http://127.0.0.1:8000/getDeliveryLocation (orderID in payload)")
     print("    * Returns delivery location for an order by finding customer's current_location")
     
